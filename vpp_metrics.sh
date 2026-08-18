@@ -3,7 +3,7 @@
 ###############################################################################
 # VPP / VyOS CGNAT Prometheus exporter
 #
-# Version: 4.1-production
+# Version: 5.0-production
 #
 # Tested against:
 #   VyOS 2026.07.x
@@ -19,15 +19,13 @@
 #   vppctl show runtime
 #
 # Output:
-#   /run/node_exporter/collector/vpp_metrics2.prom
+#   /run/node_exporter/collector/vpp_metrics.prom
 #
 # IMPORTANT:
 #   - no "clear" commands are executed
 #   - no VPP state is modified
 #   - all counters are read-only
 #   - node counters are aggregated across VPP workers
-#   - output is published atomically
-#   - invalid Prometheus samples are never published
 ###############################################################################
 
 set -u
@@ -46,6 +44,9 @@ VPPCTL="/usr/bin/vppctl"
 # DET44 implementation has 1000 session slots per user.
 DET44_SESSION_CAPACITY_PER_USER=1000
 
+# ports_per_host is obtained dynamically from "show det44 mappings".
+# Normally it is 1008 for ratio 64.
+
 ###############################################################################
 # Cleanup
 ###############################################################################
@@ -53,15 +54,6 @@ DET44_SESSION_CAPACITY_PER_USER=1000
 cleanup()
 {
     rm -f "$TMP_FILE"
-    
-    rm -f \
-    "$MAP_FILE" \
-    "$SES_FILE" \
-    "$BUF_FILE" \
-    "$HW_FILE" \
-    "$IF_FILE" \
-    "$NODE_FILE" \
-    "$RUN_FILE"
 }
 
 trap cleanup EXIT INT TERM
@@ -73,32 +65,46 @@ trap cleanup EXIT INT TERM
 mkdir -p "$TEXTFILE_DIR" || exit 1
 
 if [ ! -x "$VPPCTL" ]; then
-echo "ERROR: $VPPCTL not found or not executable" >&2
-exit 1
+    echo "ERROR: $VPPCTL not found or not executable" >&2
+    exit 1
 fi
+
+: > "$TMP_FILE"
 
 ###############################################################################
 # Temporary command files
 ###############################################################################
 
-MAP_FILE="/tmp/vpp_metrics_v4_map.$$"
-SES_FILE="/tmp/vpp_metrics_v4_ses.$$"
-BUF_FILE="/tmp/vpp_metrics_v4_buf.$$"
-HW_FILE="/tmp/vpp_metrics_v4_hw.$$"
-IF_FILE="/tmp/vpp_metrics_v4_if.$$"
-NODE_FILE="/tmp/vpp_metrics_v4_node.$$"
-RUN_FILE="/tmp/vpp_metrics_v4_run.$$"
+MAP_FILE="/tmp/vpp_metrics_v5_map.$$"
+SES_FILE="/tmp/vpp_metrics_v5_ses.$$"
+BUF_FILE="/tmp/vpp_metrics_v5_buf.$$"
+HW_FILE="/tmp/vpp_metrics_v5_hw.$$"
+IF_FILE="/tmp/vpp_metrics_v5_if.$$"
+NODE_FILE="/tmp/vpp_metrics_v5_node.$$"
+RUN_FILE="/tmp/vpp_metrics_v5_run.$$"
 
 rm -f \
-"$MAP_FILE" \
-"$SES_FILE" \
-"$BUF_FILE" \
-"$HW_FILE" \
-"$IF_FILE" \
-"$NODE_FILE" \
-"$RUN_FILE"
+    "$MAP_FILE" \
+    "$SES_FILE" \
+    "$BUF_FILE" \
+    "$HW_FILE" \
+    "$IF_FILE" \
+    "$NODE_FILE" \
+    "$RUN_FILE"
 
-: > "$TMP_FILE"
+cleanup_extra()
+{
+    rm -f \
+        "$MAP_FILE" \
+        "$SES_FILE" \
+        "$BUF_FILE" \
+        "$HW_FILE" \
+        "$IF_FILE" \
+        "$NODE_FILE" \
+        "$RUN_FILE"
+}
+
+trap 'cleanup; cleanup_extra' EXIT INT TERM
 
 ###############################################################################
 # Execute VPP commands
@@ -135,9 +141,9 @@ cat >> "$TMP_FILE" <<'EOF'
 EOF
 
 if [ "$MAP_RC" -eq 0 ] && [ -s "$MAP_FILE" ]; then
-echo "vpp_metrics_up 1" >> "$TMP_FILE"
+    echo "vpp_metrics_up 1" >> "$TMP_FILE"
 else
-echo "vpp_metrics_up 0" >> "$TMP_FILE"
+    echo "vpp_metrics_up 0" >> "$TMP_FILE"
 fi
 
 cat >> "$TMP_FILE" <<'EOF'
@@ -206,10 +212,6 @@ BEGIN {
     sessions=0
 }
 
-{
-    sub(/\r$/, "", $0)
-}
-
 $1=="in" && $3=="out" {
     inside=$2
     outside=$4
@@ -227,84 +229,79 @@ $1=="number" && $2=="of" && $3=="ports" && $4=="per" && $5=="inside" && $6=="hos
 }
 
 $1=="sessions" && $2=="number:" {
-    
     sessions=$3
-    
+
     split(inside, ia, "/")
     split(outside, oa, "/")
-    
+
     in_hosts = 2 ^ (32 - ia[2])
     out_ips  = 2 ^ (32 - oa[2])
-    
+
     session_capacity = in_hosts * 1000
     port_capacity = in_hosts * ports
-    
+
     if (session_capacity > 0)
-    session_util = sessions / session_capacity
+        session_util = sessions / session_capacity
     else
-    session_util = 0
-    
+        session_util = 0
+
     if (port_capacity > 0)
-    port_util = sessions / port_capacity
+        port_util = sessions / port_capacity
     else
-    port_util = 0
-    
+        port_util = 0
+
     printf "vpp_cgnat_mapping_info{inside=\"%s\",outside_pool=\"%s\"} 1\n", \
-    esc(inside), esc(outside)
-    
+        esc(inside), esc(outside)
+
     printf "vpp_cgnat_mapping_sharing_ratio{inside=\"%s\",outside_pool=\"%s\"} %d\n", \
-    esc(inside), esc(outside), ratio
-    
+        esc(inside), esc(outside), ratio
+
     printf "vpp_cgnat_mapping_ports_per_host{inside=\"%s\",outside_pool=\"%s\"} %d\n", \
-    esc(inside), esc(outside), ports
-    
+        esc(inside), esc(outside), ports
+
     printf "vpp_cgnat_mapping_inside_hosts{inside=\"%s\",outside_pool=\"%s\"} %d\n", \
-    esc(inside), esc(outside), in_hosts
-    
+        esc(inside), esc(outside), in_hosts
+
     printf "vpp_cgnat_mapping_outside_ips{inside=\"%s\",outside_pool=\"%s\"} %d\n", \
-    esc(inside), esc(outside), out_ips
-    
+        esc(inside), esc(outside), out_ips
+
     printf "vpp_cgnat_mapping_session_capacity{inside=\"%s\",outside_pool=\"%s\"} %d\n", \
-    esc(inside), esc(outside), session_capacity
-    
+        esc(inside), esc(outside), session_capacity
+
     printf "vpp_cgnat_mapping_port_capacity{inside=\"%s\",outside_pool=\"%s\"} %d\n", \
-    esc(inside), esc(outside), port_capacity
-    
+        esc(inside), esc(outside), port_capacity
+
     printf "vpp_cgnat_mapping_sessions{inside=\"%s\",outside_pool=\"%s\"} %d\n", \
-    esc(inside), esc(outside), sessions
-    
+        esc(inside), esc(outside), sessions
+
     printf "vpp_cgnat_mapping_session_utilization{inside=\"%s\",outside_pool=\"%s\"} %.8f\n", \
-    esc(inside), esc(outside), session_util
-    
+        esc(inside), esc(outside), session_util
+
     printf "vpp_cgnat_mapping_port_utilization_estimate{inside=\"%s\",outside_pool=\"%s\"} %.8f\n", \
-    esc(inside), esc(outside), port_util
-    
+        esc(inside), esc(outside), port_util
+
     total_sessions += sessions
     total_session_capacity += session_capacity
     total_port_capacity += port_capacity
 }
-
 END {
     printf "# HELP vpp_cgnat_total_sessions Total active DET44 sessions\n"
     printf "# TYPE vpp_cgnat_total_sessions gauge\n"
     printf "vpp_cgnat_total_sessions %d\n", total_sessions
-    
+
     printf "# HELP vpp_cgnat_total_session_capacity Total DET44 session capacity\n"
     printf "# TYPE vpp_cgnat_total_session_capacity gauge\n"
     printf "vpp_cgnat_total_session_capacity %d\n", total_session_capacity
-    
+
     printf "# HELP vpp_cgnat_total_port_capacity Total theoretical DET44 port capacity\n"
     printf "# TYPE vpp_cgnat_total_port_capacity gauge\n"
     printf "vpp_cgnat_total_port_capacity %d\n", total_port_capacity
-    
-    printf "# HELP vpp_cgnat_total_session_utilization Total DET44 session utilization\n"
-    printf "# TYPE vpp_cgnat_total_session_utilization gauge\n"
-    
+
     if (total_session_capacity > 0)
-    printf "vpp_cgnat_total_session_utilization %.8f\n", \
-    total_sessions / total_session_capacity
-    else
-    printf "vpp_cgnat_total_session_utilization 0\n"
+        printf "# HELP vpp_cgnat_total_session_utilization Total DET44 session utilization\n"
+        printf "# TYPE vpp_cgnat_total_session_utilization gauge\n"
+        printf "vpp_cgnat_total_session_utilization %.8f\n", \
+            total_sessions / total_session_capacity
 }
 ' "$MAP_FILE" >> "$TMP_FILE"
 
@@ -332,6 +329,12 @@ cat >> "$TMP_FILE" <<'EOF'
 # HELP vpp_cgnat_user_sessions_state Active DET44 sessions by state
 # TYPE vpp_cgnat_user_sessions_state gauge
 
+# HELP vpp_cgnat_protocol_sessions Active DET44 sessions by protocol
+# TYPE vpp_cgnat_protocol_sessions gauge
+
+# HELP vpp_cgnat_protocol_share Active DET44 session share by protocol
+# TYPE vpp_cgnat_protocol_share gauge
+
 # HELP vpp_cgnat_real_ip_sessions Active sessions per exact external Real IP
 # TYPE vpp_cgnat_real_ip_sessions gauge
 EOF
@@ -350,94 +353,107 @@ function state_proto(s) {
     return "unknown"
 }
 
-{
-    sub(/\r$/, "", $0)
-}
-
 $1=="in" {
-    
+
     split($2, inparts, ":")
     inside=inparts[1]
-    
+
     out_ip=""
     state="unknown"
-    
+    expire=""
+
     if ($3=="out") {
         split($4, outparts, ":")
         out_ip=outparts[1]
     }
-    
+
     for (i=5; i<=NF; i++) {
-        
         if ($i=="state:") {
             state=$(i+1)
         }
-        
+
+        if ($i=="expire:") {
+            expire=$(i+1)
+        }
     }
-    
+
     if (inside == "")
-    next
-    
+        next
+
     user_sessions[inside]++
-    
+
     if (out_ip != "") {
         real_ip_sessions[out_ip]++
         user_external[inside SUBSEP out_ip]=1
     }
-    
+
+    proto=state_proto(state)
     user_state[inside SUBSEP state]++
-    
+    protocol_sessions[proto]++
+
+    total_user_sessions++
+
     next
 }
 
 END {
-    
+
     for (u in user_sessions) {
-        
+
         printf "vpp_cgnat_user_sessions{inside=\"%s\"} %d\n", \
-        esc(u), user_sessions[u]
-        
+            esc(u), user_sessions[u]
+
         printf "vpp_cgnat_user_session_capacity{inside=\"%s\"} 1000\n", \
-        esc(u)
-        
+            esc(u)
+
         printf "vpp_cgnat_user_session_utilization{inside=\"%s\"} %.8f\n", \
-        esc(u), user_sessions[u] / 1000
-        
+            esc(u), user_sessions[u] / 1000
+
         ext_count=0
-        
+
         for (x in user_external) {
             split(x, p, SUBSEP)
-            
             if (p[1] == u)
-            ext_count++
+                ext_count++
         }
-        
+
         printf "vpp_cgnat_user_external_hosts{inside=\"%s\"} %d\n", \
-        esc(u), ext_count
+            esc(u), ext_count
     }
-    
+
     for (x in user_state) {
-        
+
         split(x, p, SUBSEP)
-        
+
         printf "vpp_cgnat_user_sessions_state{inside=\"%s\",state=\"%s\",protocol=\"%s\"} %d\n", \
-        esc(p[1]), esc(p[2]), state_proto(p[2]), user_state[x]
+            esc(p[1]), esc(p[2]), state_proto(p[2]), user_state[x]
     }
-    
+
+    for (proto in protocol_sessions) {
+        printf "vpp_cgnat_protocol_sessions{protocol=\"%s\"} %d\n", \
+            esc(proto), protocol_sessions[proto]
+    }
+
+    if (total_user_sessions > 0) {
+        for (proto in protocol_sessions) {
+            printf "vpp_cgnat_protocol_share{protocol=\"%s\"} %.8f\n", \
+                esc(proto), protocol_sessions[proto] / total_user_sessions
+        }
+    }
+
     for (ip in real_ip_sessions) {
-        
+
         printf "vpp_cgnat_real_ip_sessions{real_ip=\"%s\"} %d\n", \
-        esc(ip), real_ip_sessions[ip]
+            esc(ip), real_ip_sessions[ip]
     }
-    
+
     printf "# HELP vpp_cgnat_active_users Number of inside hosts with active DET44 sessions\n"
     printf "# TYPE vpp_cgnat_active_users gauge\n"
-    
+
     active=0
-    
     for (u in user_sessions)
-    active++
-    
+        active++
+
     printf "vpp_cgnat_active_users %d\n", active
 }
 ' "$SES_FILE" >> "$TMP_FILE"
@@ -459,10 +475,6 @@ cat >> "$TMP_FILE" <<'EOF'
 EOF
 
 awk '
-{
-    sub(/\r$/, "", $0)
-}
-
 $1=="in" && $3=="out" {
     inside=$2
     outside=$4
@@ -475,40 +487,43 @@ $1=="outside" && $2=="address" && $3=="sharing" && $4=="ratio:" {
 }
 
 $1=="sessions" && $2=="number:" {
-    
+
     split(outside, p, "/")
-    
+
     outside_ips=2 ^ (32-p[2])
+
     users_per_ip=ratio
+
     session_capacity=users_per_ip * 1000
-    
+
+    # Expand outside CIDR.
     split(p[1], oct, ".")
-    
+
     base=(oct[1]*256*256*256) + \
-    (oct[2]*256*256) + \
-    (oct[3]*256) + \
-    oct[4]
-    
+         (oct[2]*256*256) + \
+         (oct[3]*256) + \
+         oct[4]
+
     for (i=0; i<outside_ips; i++) {
-        
+
         n=base+i
-        
+
         a=int(n/(256*256*256))
         r=n%(256*256*256)
-        
+
         b=int(r/(256*256))
         r=r%(256*256)
-        
+
         c=int(r/256)
         d=r%256
-        
+
         ip=a "." b "." c "." d
-        
+
         printf "vpp_cgnat_real_ip_user_capacity{real_ip=\"%s\"} %d\n", \
-        ip, users_per_ip
-        
+            ip, users_per_ip
+
         printf "vpp_cgnat_real_ip_session_capacity{real_ip=\"%s\"} %d\n", \
-        ip, session_capacity
+            ip, session_capacity
     }
 }
 ' "$MAP_FILE" >> "$TMP_FILE"
@@ -527,24 +542,18 @@ cat >> "$TMP_FILE" <<'EOF'
 EOF
 
 awk '
-{
-    sub(/\r$/, "", $0)
-}
-
 $2=="det44-in2out" && $NF=="error" {
-    
+
     reason=""
-    
+
     for (i=3; i<NF; i++) {
-        
         if (reason != "")
-        reason=reason " "
-        
+            reason=reason " "
         reason=reason $i
     }
-    
+
     if (reason=="Out of ports")
-    total += $1
+        total += $1
 }
 
 END {
@@ -556,6 +565,13 @@ fi
 
 ###############################################################################
 # 5. VPP NODE COUNTERS
+#
+# IMPORTANT:
+# "show node counters" may contain repeated node/reason entries from
+# different VPP workers.
+#
+# Aggregate by:
+#   node + reason + severity
 ###############################################################################
 
 if [ "$NODE_RC" -eq 0 ] && [ -s "$NODE_FILE" ]; then
@@ -566,59 +582,53 @@ cat >> "$TMP_FILE" <<'EOF'
 EOF
 
 awk '
-{
-    sub(/\r$/, "", $0)
-}
-
 NR==1 {
     next
 }
 
 $1 ~ /^[0-9]+$/ && NF >= 4 {
-    
+
     count=$1
     node=$2
     severity=$NF
-    
+
     reason=""
-    
+
     for (i=3; i<NF; i++) {
-        
         if (reason != "")
-        reason=reason " "
-        
+            reason=reason " "
         reason=reason $i
     }
-    
+
     if (reason=="")
-    next
-    
+        next
+
     key=node SUBSEP reason SUBSEP severity
-    
+
     counters[key]+=count
 }
 
 END {
-    
+
     for (key in counters) {
-        
+
         split(key, p, SUBSEP)
-        
+
         node=p[1]
         reason=p[2]
         severity=p[3]
-        
+
         gsub(/\\/,"\\\\",node)
         gsub(/"/,"\\\"",node)
-        
+
         gsub(/\\/,"\\\\",reason)
         gsub(/"/,"\\\"",reason)
-        
+
         gsub(/\\/,"\\\\",severity)
         gsub(/"/,"\\\"",severity)
-        
+
         printf "vpp_node_counter_total{node=\"%s\",reason=\"%s\",severity=\"%s\"} %d\n", \
-        node, reason, severity, counters[key]
+            node, reason, severity, counters[key]
     }
 }
 ' "$NODE_FILE" >> "$TMP_FILE"
@@ -648,14 +658,25 @@ $0 !~ /^[ \t]/ && NF > 0 && $1 != "Name" {
     iface=$1
 }
 
-$0 ~ /rx miss/ {
+/^[ \t]+rx missed[ \t]+[0-9]+$/ {
     if (iface != "")
-    printf "vpp_hw_rx_missed{interface=\"%s\"} %s\n", iface, $NF
+        printf "vpp_hw_rx_missed{interface=\"%s\"} %s\n", iface, $NF
 }
 
-$0 ~ /rx out of buffer/ {
+
+/^[ \t]+rx out of buffer[ \t]+[0-9]+$/ {
     if (iface != "")
-    printf "vpp_hw_rx_no_buffer{interface=\"%s\"} %s\n", iface, $NF
+        printf "vpp_hw_rx_no_buffer{interface=\"%s\"} %s\n", iface, $NF
+}
+
+/^[ \t]+rx no buffer[ \t]+[0-9]+$/ {
+    if (iface != "")
+        printf "vpp_hw_rx_no_buffer{interface=\"%s\"} %s\n", iface, $NF
+}
+
+/^[ \t]+rx_no_buffer[ \t]+[0-9]+$/ {
+    if (iface != "")
+        printf "vpp_hw_rx_no_buffer{interface=\"%s\"} %s\n", iface, $NF
 }
 ' "$HW_FILE" >> "$TMP_FILE"
 
@@ -699,24 +720,23 @@ $0 !~ /^[ \t]/ && NF >= 2 && $1 != "Name" {
     iface=$1
 }
 
-# Використовуємо відлік з кінця рядка: $(NF-2) та $(NF-1)
-$(NF-2)=="rx" && $(NF-1)=="packets" && iface!="" {
+$1=="rx" && $2=="packets" && iface!="" {
     printf "vpp_if_rx_packets{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 
-$(NF-2)=="rx" && $(NF-1)=="bytes" && iface!="" {
+$1=="rx" && $2=="bytes" && iface!="" {
     printf "vpp_if_rx_bytes{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 
-$(NF-2)=="tx" && $(NF-1)=="packets" && iface!="" {
+$1=="tx" && $2=="packets" && iface!="" {
     printf "vpp_if_tx_packets{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 
-$(NF-2)=="tx" && $(NF-1)=="bytes" && iface!="" {
+$1=="tx" && $2=="bytes" && iface!="" {
     printf "vpp_if_tx_bytes{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 
-$(NF-1)=="drops" && iface!="" {
+$1=="drops" && iface!="" {
     printf "vpp_if_drops{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 ' "$IF_FILE" >> "$TMP_FILE"
@@ -747,33 +767,29 @@ cat >> "$TMP_FILE" <<'EOF'
 EOF
 
 awk '
-{
-    sub(/\r$/, "", $0)
-}
-
 NR==1 {
     next
 }
 
 $1 ~ /^default-numa-/ && NF >= 9 {
-    
+
     pool=$1
     total=$6
     avail=$7
     cached=$8
     used=$9
-    
+
     printf "vpp_buffers_avail{pool=\"%s\"} %s\n", pool, avail
     printf "vpp_buffers_total{pool=\"%s\"} %s\n", pool, total
     printf "vpp_buffers_cached{pool=\"%s\"} %s\n", pool, cached
     printf "vpp_buffers_used{pool=\"%s\"} %s\n", pool, used
-    
+
     denom=used+avail
-    
+
     if (denom > 0)
-    printf "vpp_buffers_used_ratio{pool=\"%s\"} %.8f\n", pool, used/denom
+        printf "vpp_buffers_used_ratio{pool=\"%s\"} %.8f\n", pool, used/denom
     else
-    printf "vpp_buffers_used_ratio{pool=\"%s\"} 0\n", pool
+        printf "vpp_buffers_used_ratio{pool=\"%s\"} 0\n", pool
 }
 ' "$BUF_FILE" >> "$TMP_FILE"
 
@@ -788,168 +804,87 @@ if [ "$RUN_RC" -eq 0 ] && [ -s "$RUN_FILE" ]; then
 cat >> "$TMP_FILE" <<'EOF'
 # HELP vpp_runtime_vector_rate Average VPP vector rate per thread
 # TYPE vpp_runtime_vector_rate gauge
+
 # HELP vpp_runtime_loops_sec VPP loops per second per thread
 # TYPE vpp_runtime_loops_sec gauge
+
 # HELP vpp_runtime_average_vectors Average vectors per node per thread
 # TYPE vpp_runtime_average_vectors gauge
 EOF
 
 awk '
-
 function esc(s) {
     gsub(/\\/,"\\\\",s)
     gsub(/"/,"\\\"",s)
     return s
 }
 
-function clean_num(s) {
+function clean(s) {
     gsub(/,/, "", s)
+    gsub(/\r/, "", s)
     return s
 }
 
-function is_number(s) {
-    s=clean_num(s)
-    
-    if (s == "NaN" || s == "+Inf" || s == "-Inf")
-    return 1
-    
-    if (s ~ /^[+-]?[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/)
-    return 1
-    
-    if (s ~ /^[+-]?[.][0-9]+([eE][+-]?[0-9]+)?$/)
-    return 1
-    
+function valid_number(s) {
+    s=clean(s)
+    if (s == "NaN" || s == "+Inf" || s == "-Inf") return 1
+    if (s ~ /^[+-]?[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/) return 1
+    if (s ~ /^[+-]?[.][0-9]+([eE][+-]?[0-9]+)?$/) return 1
     return 0
 }
 
-function emit_rate(thread, direction, value) {
-    
-    value=clean_num(value)
-    
-    if (is_number(value)) {
-        printf "vpp_runtime_vector_rate{thread=\"%s\",direction=\"%s\"} %s\n", \
-        esc(thread), direction, value
-    }
-}
-
-{
-    # Remove CR and other trailing whitespace
-    sub(/\r$/, "", $0)
-}
-
 $1=="Thread" {
-    
     thread=""
-    
     for (i=1; i<=NF; i++) {
-        
-        if ($i ~ /^vpp_main$/ ||
-        $i ~ /^vpp_wk_[0-9]+$/) {
-            
+        if ($i ~ /^vpp_(main|wk_[0-9]+)$/) {
             thread=$i
             break
         }
     }
-    
     next
 }
 
-thread != "" && $1=="Time" {
-    
+thread != "" {
+    # vectors/node may occur on Time rows or other formatting variants.
     for (i=1; i<=NF; i++) {
-        
         if ($i=="vectors/node" && i<NF) {
-            
             avg=$(i+1)
-            
-            if (is_number(avg)) {
-                
-                printf "vpp_runtime_average_vectors{thread=\"%s\"} %s\n", \
-                esc(thread), clean_num(avg)
+            if (valid_number(avg))
+                printf "vpp_runtime_average_vectors{thread=\"%s\"} %s\n", esc(thread), clean(avg)
+        }
+    }
+
+    # Parse vector rates by label, never by fixed column position.
+    if ($1=="vector" && $2=="rates") {
+        in_rate=""; out_rate=""; drop_rate=""
+        for (i=1; i<NF; i++) {
+            token=$i
+            gsub(/,/, "", token)
+            if (token=="in") {
+                v=$(i+1); if (valid_number(v)) in_rate=clean(v)
             }
-            
+            if (token=="out") {
+                v=$(i+1); if (valid_number(v)) out_rate=clean(v)
+            }
+            if (token=="drop") {
+                v=$(i+1); if (valid_number(v)) drop_rate=clean(v)
+            }
+        }
+        if (in_rate!="") printf "vpp_runtime_vector_rate{thread=\"%s\",direction=\"in\"} %s\n", esc(thread), in_rate
+        if (out_rate!="") printf "vpp_runtime_vector_rate{thread=\"%s\",direction=\"out\"} %s\n", esc(thread), out_rate
+        if (drop_rate!="") printf "vpp_runtime_vector_rate{thread=\"%s\",direction=\"drop\"} %s\n", esc(thread), drop_rate
+    }
+
+    # loops/sec can appear independently of vector rates.
+    for (i=1; i<NF; i++) {
+        if ($i=="loops/sec") {
+            loops=$(i+1)
+            if (valid_number(loops))
+                printf "vpp_runtime_loops_sec{thread=\"%s\"} %s\n", esc(thread), clean(loops)
             break
         }
     }
-    
-    # Do NOT next here.
 }
-
-thread != "" && $1=="vector" && $2=="rates" {
-    
-    in_rate=""
-    out_rate=""
-    drop_rate=""
-    
-    for (i=1; i<=NF; i++) {
-        
-        token=$i
-        gsub(/,/, "", token)
-        
-        if (token=="in" && i<NF) {
-            
-            candidate=$(i+1)
-            
-            if (is_number(candidate))
-            in_rate=candidate
-        }
-        
-        if (token=="out" && i<NF) {
-            
-            candidate=$(i+1)
-            
-            if (is_number(candidate))
-            out_rate=candidate
-        }
-        
-        if (token=="drop" && i<NF) {
-            
-            candidate=$(i+1)
-            
-            if (is_number(candidate))
-            drop_rate=candidate
-        }
-    }
-    
-    if (in_rate != "")
-    emit_rate(thread, "in", in_rate)
-    
-    if (out_rate != "")
-    emit_rate(thread, "out", out_rate)
-    
-    if (drop_rate != "")
-    emit_rate(thread, "drop", drop_rate)
-    
-    next
-}
-
-thread != "" && $0 ~ /loops\/sec/ {
-    
-    loops=""
-    
-    for (i=1; i<=NF; i++) {
-        
-        token=$i
-        gsub(/,/, "", token)
-        
-        if (token=="loops/sec" && i<NF) {
-            
-            candidate=$(i+1)
-            
-            if (is_number(candidate))
-            loops=candidate
-            
-            break
-        }
-    }
-    
-    if (loops != "") {
-        
-        printf "vpp_runtime_loops_sec{thread=\"%s\"} %s\n", \
-        esc(thread), clean_num(loops)
-    }
-}
-
 ' "$RUN_FILE" >> "$TMP_FILE"
 
 fi
@@ -969,95 +904,40 @@ EOF
 ###############################################################################
 
 if [ ! -s "$TMP_FILE" ]; then
-echo "ERROR: generated metrics file is empty" >&2
-exit 1
+    echo "ERROR: generated metrics file is empty" >&2
+    exit 1
 fi
 
 ###############################################################################
-# 12. CRLF validation
-###############################################################################
-
-if grep -q $'\r' "$TMP_FILE"; then
-echo "ERROR: CR character detected in generated metrics file" >&2
-exit 1
-fi
-
-###############################################################################
-# 13. Prometheus numeric value validation
-#
-# Every metric sample must end with a valid numeric value.
-#
-# This is especially important for vpp_runtime_vector_rate because a parser
-# error must NEVER be allowed to publish:
-#
-#   metric{...} out
-#
-# which would break the entire node_exporter textfile collector.
-###############################################################################
-
-INVALID_VALUES=$(
-    awk '
-    function valid_number(s) {
-        
-        if (s == "NaN" || s == "+Inf" || s == "-Inf")
-        return 1
-        
-        if (s ~ /^[+-]?[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/)
-        return 1
-        
-        if (s ~ /^[+-]?[.][0-9]+([eE][+-]?[0-9]+)?$/)
-        return 1
-        
-        return 0
-    }
-    ' "$TMP_FILE"
-)
-
-if [ -n "$INVALID_VALUES" ]; then
-
-echo "ERROR: invalid Prometheus metric value detected; keeping previous file" >&2
-echo "$INVALID_VALUES" >&2
-
-exit 1
-fi
-
-###############################################################################
-# 14. Duplicate sample detection
+# 12. Duplicate sample detection
 #
 # Prometheus does not allow two samples with the same complete label set.
+# Detect obvious duplicates before publishing.
 ###############################################################################
 
 DUPLICATES=$(
     awk '
     /^vpp_[a-zA-Z0-9_]+{/ {
-    
-    line=$0
-    
-    sub(/ [^ ]+$/, "", line)
-    
-    samples[line]++
+        line=$0
+        sub(/ [^ ]+$/, "", line)
+        samples[line]++
     }
-    
     END {
-        
         for (x in samples)
-        
-        if (samples[x] > 1)
-        print x
+            if (samples[x] > 1)
+                print x
     }
     ' "$TMP_FILE"
 )
 
 if [ -n "$DUPLICATES" ]; then
-
-echo "ERROR: duplicate Prometheus samples detected; keeping previous file" >&2
-echo "$DUPLICATES" >&2
-
-exit 1
+    echo "ERROR: duplicate Prometheus samples detected; keeping previous file" >&2
+    echo "$DUPLICATES" >&2
+    exit 1
 fi
 
 ###############################################################################
-# 15. Atomic publish
+# 13. Atomic publish
 ###############################################################################
 
 chmod 644 "$TMP_FILE"
