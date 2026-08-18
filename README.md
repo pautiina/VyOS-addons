@@ -12,3 +12,7 @@ set system task-scheduler task vpp_metrics interval '1m'
 /config/scripts/vpp_metrics.sh
 ```
 Потім налаштовувати Prometheus and Grafana
+
+# Використання основних метрик
+В кастомний дашборд також додані інші метрики с іншого дашборду: https://grafana.com/grafana/dashboards/20315-vpp-performance-details/
+Тому його теж необхідно налаштувати, а щоб метрики почали збиратись, необхідно в стартовий ```/config/scripts/vyos-postconfig-bootup.script``` додати скрипт з репозиторію. (на момент написання скриптів - VyOS ще не вміє через конфігурацію налаштовувати: vpp_prometheus_export
