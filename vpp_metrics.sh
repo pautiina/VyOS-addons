@@ -3,7 +3,7 @@
 ###############################################################################
 # VPP / VyOS CGNAT Prometheus exporter
 #
-# Version: 5.1-production
+# Version: 5.3-production
 #
 # Tested against:
 #   VyOS 2026.07.x
@@ -968,7 +968,7 @@ EOF
 
 if grep -q $'\r' "$TMP_FILE" 2>/dev/null; then
     CLEAN_FILE="${TMP_FILE}.clean"
-    if ! tr -d '\r' < "$TMP_FILE" > "$CLEAN_FILE"; then
+    if ! tr -d '\015' < "$TMP_FILE" > "$CLEAN_FILE"; then
         echo "ERROR: failed to normalize generated metrics file" >&2
         rm -f "$CLEAN_FILE"
         exit 1
