@@ -955,7 +955,29 @@ vpp_metrics_last_collection_timestamp_seconds $(date +%s)
 EOF
 
 ###############################################################################
-# 11. Basic validation
+# 11. Normalize generated Prometheus text
+#
+# VPP CLI output may contain carriage returns (CR) even when the source
+# command file itself looks normal.  A CR anywhere in a Prometheus sample
+# corrupts the textfile format and can make grep output look like:
+#   "} 123metric_name..."
+#
+# Prometheus text format does not need CR characters, so remove ALL CR bytes
+# from the generated file before validation/publication.
+###############################################################################
+
+if grep -q $'\r' "$TMP_FILE" 2>/dev/null; then
+    CLEAN_FILE="${TMP_FILE}.clean"
+    if ! tr -d '\r' < "$TMP_FILE" > "$CLEAN_FILE"; then
+        echo "ERROR: failed to normalize generated metrics file" >&2
+        rm -f "$CLEAN_FILE"
+        exit 1
+    fi
+    mv -f "$CLEAN_FILE" "$TMP_FILE"
+fi
+
+###############################################################################
+# 12. Basic validation
 ###############################################################################
 
 if [ ! -s "$TMP_FILE" ]; then
@@ -964,7 +986,7 @@ if [ ! -s "$TMP_FILE" ]; then
 fi
 
 ###############################################################################
-# 12. Duplicate sample detection
+# 13. Duplicate sample detection
 #
 # Prometheus does not allow two samples with the same complete label set.
 # Detect obvious duplicates before publishing.
@@ -992,7 +1014,7 @@ if [ -n "$DUPLICATES" ]; then
 fi
 
 ###############################################################################
-# 13. Atomic publish
+# 14. Atomic publish
 ###############################################################################
 
 chmod 644 "$TMP_FILE"
