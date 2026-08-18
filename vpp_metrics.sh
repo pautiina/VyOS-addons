@@ -3,7 +3,7 @@
 ###############################################################################
 # VPP / VyOS CGNAT Prometheus exporter
 #
-# Version: 5.0-production
+# Version: 5.1-production
 #
 # Tested against:
 #   VyOS 2026.07.x
@@ -41,11 +41,25 @@ TMP_FILE="${PROM_FILE}.tmp.$$"
 
 VPPCTL="/usr/bin/vppctl"
 
-# DET44 implementation has 1000 session slots per user.
+# DET44 session capacity per inside host.
+# This is a VPP DET44 session-slot limit, NOT the number of ports.
+# Keep configurable because it is an implementation/configuration parameter.
 DET44_SESSION_CAPACITY_PER_USER=1000
 
-# ports_per_host is obtained dynamically from "show det44 mappings".
-# Normally it is 1008 for ratio 64.
+# DET44 ports-per-host is NEVER configured statically here.
+# The exporter takes the value reported by:
+#   vppctl show det44 mappings
+# and calculates a CIDR-based fallback only if VPP does not print it.
+#
+# With /24 -> /30:
+#   sharing ratio = 256 / 4 = 64
+#   usable port slots = 64 * 1008 = 64512
+#   ports/host = 64512 / 64 = 1008
+#
+# With /24 -> /32:
+#   sharing ratio = 256 / 1 = 256
+#   ports/host = 64512 / 256 = 252
+DET44_USABLE_PORT_SLOTS=64512
 
 ###############################################################################
 # Cleanup
@@ -197,7 +211,7 @@ cat >> "$TMP_FILE" <<'EOF'
 # TYPE vpp_cgnat_mapping_port_utilization_estimate gauge
 EOF
 
-awk '
+awk -v session_cap="$DET44_SESSION_CAPACITY_PER_USER" -v usable_ports="$DET44_USABLE_PORT_SLOTS" '
 function esc(s) {
     gsub(/\\/,"\\\\",s)
     gsub(/"/,"\\\"",s)
@@ -212,9 +226,16 @@ BEGIN {
     sessions=0
 }
 
+{
+    sub(/\r$/, "", $0)
+}
+
 $1=="in" && $3=="out" {
     inside=$2
     outside=$4
+    ratio=0
+    ports=0
+    sessions=0
     next
 }
 
@@ -237,7 +258,21 @@ $1=="sessions" && $2=="number:" {
     in_hosts = 2 ^ (32 - ia[2])
     out_ips  = 2 ^ (32 - oa[2])
 
-    session_capacity = in_hosts * 1000
+    # VPP printed values are authoritative.
+    # If either value is missing/invalid, derive it from the CIDRs.
+    cidr_ratio = 0
+    cidr_ports = 0
+
+    if (out_ips > 0)
+        cidr_ratio = in_hosts / out_ips
+
+    if (ratio <= 0 && cidr_ratio > 0)
+        ratio = cidr_ratio
+
+    if (ports <= 0 && ratio > 0)
+        ports = int((usable_ports / ratio) + 0.5)
+
+    session_capacity = in_hosts * session_cap
     port_capacity = in_hosts * ports
 
     if (session_capacity > 0)
@@ -339,7 +374,7 @@ cat >> "$TMP_FILE" <<'EOF'
 # TYPE vpp_cgnat_real_ip_sessions gauge
 EOF
 
-awk '
+awk -v session_cap="$DET44_SESSION_CAPACITY_PER_USER" '
 function esc(s) {
     gsub(/\\/,"\\\\",s)
     gsub(/"/,"\\\"",s)
@@ -351,6 +386,10 @@ function state_proto(s) {
     if (s ~ /^udp-/) return "udp"
     if (s ~ /^icmp-/) return "icmp"
     return "unknown"
+}
+
+{
+    sub(/\r$/, "", $0)
 }
 
 $1=="in" {
@@ -407,7 +446,7 @@ END {
             esc(u)
 
         printf "vpp_cgnat_user_session_utilization{inside=\"%s\"} %.8f\n", \
-            esc(u), user_sessions[u] / 1000
+            esc(u), user_sessions[u] / session_cap
 
         ext_count=0
 
@@ -474,10 +513,15 @@ cat >> "$TMP_FILE" <<'EOF'
 # TYPE vpp_cgnat_real_ip_session_capacity gauge
 EOF
 
-awk '
+awk -v session_cap="$DET44_SESSION_CAPACITY_PER_USER" '
+{
+    sub(/\r$/, "", $0)
+}
+
 $1=="in" && $3=="out" {
     inside=$2
     outside=$4
+    ratio=0
     next
 }
 
@@ -492,9 +536,20 @@ $1=="sessions" && $2=="number:" {
 
     outside_ips=2 ^ (32-p[2])
 
+    split(inside, ia, "/")
+    in_hosts=2 ^ (32 - ia[2])
+
+    if (outside_ips > 0)
+        cidr_ratio=in_hosts / outside_ips
+    else
+        cidr_ratio=0
+
+    if (ratio <= 0)
+        ratio=cidr_ratio
+
     users_per_ip=ratio
 
-    session_capacity=users_per_ip * 1000
+    session_capacity=users_per_ip * session_cap
 
     # Expand outside CIDR.
     split(p[1], oct, ".")
