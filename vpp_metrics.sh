@@ -3,7 +3,7 @@
 ###############################################################################
 # VPP / VyOS CGNAT Prometheus exporter
 #
-# Version: 5.3-production
+# Version: 5.4-production
 #
 # Tested against:
 #   VyOS 2026.07.x
@@ -15,7 +15,7 @@
 #   vppctl show buffers
 #   vppctl show hardware-interfaces
 #   vppctl show interface
-#   vppctl show node counters
+#   vppctl show errors
 #   vppctl show runtime
 #
 # Output:
@@ -139,7 +139,7 @@ HW_RC=$?
 "$VPPCTL" show interface > "$IF_FILE" 2>/dev/null
 IF_RC=$?
 
-"$VPPCTL" show node counters > "$NODE_FILE" 2>/dev/null
+"$VPPCTL" show errors > "$NODE_FILE" 2>/dev/null
 NODE_RC=$?
 
 "$VPPCTL" show runtime > "$RUN_FILE" 2>/dev/null
@@ -170,6 +170,7 @@ echo "vpp_metrics_command_success{command=\"det44_sessions\"} $([ "$SES_RC" -eq 
 echo "vpp_metrics_command_success{command=\"buffers\"} $([ "$BUF_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
 echo "vpp_metrics_command_success{command=\"hardware_interfaces\"} $([ "$HW_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
 echo "vpp_metrics_command_success{command=\"interfaces\"} $([ "$IF_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
+echo "vpp_metrics_command_success{command=\"node_errors\"} $([ "$NODE_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
 echo "vpp_metrics_command_success{command=\"node_counters\"} $([ "$NODE_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
 echo "vpp_metrics_command_success{command=\"runtime\"} $([ "$RUN_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
 
@@ -619,11 +620,11 @@ END {
 fi
 
 ###############################################################################
-# 5. VPP NODE COUNTERS
+# 5. VPP NODE ERROR COUNTERS
 #
 # IMPORTANT:
-# "show node counters" may contain repeated node/reason entries from
-# different VPP workers.
+# "show errors" contains Count / Node / Reason / Severity.
+# Aggregate repeated node/reason entries safely.
 #
 # Aggregate by:
 #   node + reason + severity
@@ -637,6 +638,8 @@ cat >> "$TMP_FILE" <<'EOF'
 EOF
 
 awk '
+{ sub(/\r$/, "", $0) }
+
 NR==1 {
     next
 }
@@ -719,17 +722,12 @@ $0 !~ /^[ \t]/ && NF > 0 && $1 != "Name" {
 }
 
 
-/^[ \t]+rx out of buffer[ \t]+[0-9]+$/ {
+($1=="rx_out_of_buffer" || ($1=="rx" && $2=="out" && $3=="of" && $4=="buffer")) && $NF ~ /^[0-9]+$/ {
     if (iface != "")
         printf "vpp_hw_rx_no_buffer{interface=\"%s\"} %s\n", iface, $NF
 }
 
-/^[ \t]+rx no buffer[ \t]+[0-9]+$/ {
-    if (iface != "")
-        printf "vpp_hw_rx_no_buffer{interface=\"%s\"} %s\n", iface, $NF
-}
-
-/^[ \t]+rx_no_buffer[ \t]+[0-9]+$/ {
+($1=="rx_no_buffer" || ($1=="rx" && $2=="no" && $3=="buffer")) && $NF ~ /^[0-9]+$/ {
     if (iface != "")
         printf "vpp_hw_rx_no_buffer{interface=\"%s\"} %s\n", iface, $NF
 }
@@ -767,33 +765,106 @@ function esc(s) {
     return s
 }
 
+function valid_counter(s) {
+    gsub(/,/, "", s)
+    return s ~ /^[0-9]+([.][0-9]+)?$/
+}
+
 {
     sub(/\r$/, "", $0)
 }
 
-$0 !~ /^[ \t]/ && NF >= 2 && $1 != "Name" {
+###############################################################################
+# Interface header + RX packets
+#
+# Example:
+#
+# BondEthernet0  5  up  12000/0/0/0  rx packets  97776971583
+#
+###############################################################################
+
+$0 ~ /^[^ \t][^ \t]*[ \t]+[0-9]+[ \t]+(up|down)([ \t]|$)/ {
+
     iface=$1
+
+    # RX packets находится НА ЭТОЙ ЖЕ строке
+    for (i=1; i<=NF-2; i++) {
+        if ($i == "rx" && $(i+1) == "packets") {
+
+            value=$(i+2)
+
+            if (valid_counter(value)) {
+                printf "vpp_if_rx_packets{interface=\"%s\"} %s\n", \
+                    esc(iface), value
+            }
+
+            break
+        }
+    }
+
+    next
 }
 
-$1=="rx" && $2=="packets" && iface!="" {
-    printf "vpp_if_rx_packets{interface=\"%s\"} %s\n", esc(iface), $NF
+###############################################################################
+# RX bytes
+###############################################################################
+
+$1=="rx" && $2=="bytes" {
+    value=$NF
+
+    if (iface != "" && valid_counter(value)) {
+        printf "vpp_if_rx_bytes{interface=\"%s\"} %s\n", \
+            esc(iface), value
+    }
+
+    next
 }
 
-$1=="rx" && $2=="bytes" && iface!="" {
-    printf "vpp_if_rx_bytes{interface=\"%s\"} %s\n", esc(iface), $NF
+###############################################################################
+# TX packets
+###############################################################################
+
+$1=="tx" && $2=="packets" {
+    value=$NF
+
+    if (iface != "" && valid_counter(value)) {
+        printf "vpp_if_tx_packets{interface=\"%s\"} %s\n", \
+            esc(iface), value
+    }
+
+    next
 }
 
-$1=="tx" && $2=="packets" && iface!="" {
-    printf "vpp_if_tx_packets{interface=\"%s\"} %s\n", esc(iface), $NF
+###############################################################################
+# TX bytes
+###############################################################################
+
+$1=="tx" && $2=="bytes" {
+    value=$NF
+
+    if (iface != "" && valid_counter(value)) {
+        printf "vpp_if_tx_bytes{interface=\"%s\"} %s\n", \
+            esc(iface), value
+    }
+
+    next
 }
 
-$1=="tx" && $2=="bytes" && iface!="" {
-    printf "vpp_if_tx_bytes{interface=\"%s\"} %s\n", esc(iface), $NF
+###############################################################################
+# Drops
+###############################################################################
+
+$1=="drops" {
+    value=$NF
+
+    if (iface != "" && valid_counter(value)) {
+        printf "vpp_if_drops{interface=\"%s\"} %s\n", \
+            esc(iface), value
+    }
+
+    next
 }
 
-$1=="drops" && iface!="" {
-    printf "vpp_if_drops{interface=\"%s\"} %s\n", esc(iface), $NF
-}
 ' "$IF_FILE" >> "$TMP_FILE"
 
 fi
@@ -822,6 +893,8 @@ cat >> "$TMP_FILE" <<'EOF'
 EOF
 
 awk '
+{ sub(/\r$/, "", $0) }
+
 NR==1 {
     next
 }
@@ -900,12 +973,27 @@ $1=="Thread" {
 }
 
 thread != "" {
-    # vectors/node may occur on Time rows or other formatting variants.
-    for (i=1; i<=NF; i++) {
-        if ($i=="vectors/node" && i<NF) {
+    # VPP 25.10 show runtime reports:
+    #   ... internal node vector rate 1.10 loops/sec ...
+    avg_found=0
+    for (i=1; i<NF; i++) {
+        if ($i=="rate" && i>1 && $(i-1)=="vector" && i<NF) {
             avg=$(i+1)
-            if (valid_number(avg))
+            if (valid_number(avg)) {
                 printf "vpp_runtime_average_vectors{thread=\"%s\"} %s\n", esc(thread), clean(avg)
+                avg_found=1
+            }
+            break
+        }
+    }
+    if (!avg_found) {
+        for (i=1; i<NF; i++) {
+            if ($i=="vectors/node" && i<NF) {
+                avg=$(i+1)
+                if (valid_number(avg))
+                    printf "vpp_runtime_average_vectors{thread=\"%s\"} %s\n", esc(thread), clean(avg)
+                break
+            }
         }
     }
 
