@@ -3,7 +3,7 @@
 ###############################################################################
 # VPP / VyOS CGNAT Prometheus exporter
 #
-# Version: 5.4-production
+# Version: 5.5-production
 #
 # Tested against:
 #   VyOS 2026.07.x
@@ -44,9 +44,9 @@ VPPCTL="/usr/bin/vppctl"
 # DET44 session capacity per inside host.
 # This is a VPP DET44 session-slot limit, NOT the number of ports.
 # Keep configurable because it is an implementation/configuration parameter.
-DET44_SESSION_CAPACITY_PER_USER=1000
 
 # DET44 ports-per-host is NEVER configured statically here.
+# Confirmed DET44 behavior: session capacity per inside host equals ports_per_host.
 # The exporter takes the value reported by:
 #   vppctl show det44 mappings
 # and calculates a CIDR-based fallback only if VPP does not print it.
@@ -96,6 +96,7 @@ HW_FILE="/tmp/vpp_metrics_v5_hw.$$"
 IF_FILE="/tmp/vpp_metrics_v5_if.$$"
 NODE_FILE="/tmp/vpp_metrics_v5_node.$$"
 RUN_FILE="/tmp/vpp_metrics_v5_run.$$"
+CAP_FILE="/tmp/vpp_metrics_v5_cap.$$"
 
 rm -f \
     "$MAP_FILE" \
@@ -104,7 +105,8 @@ rm -f \
     "$HW_FILE" \
     "$IF_FILE" \
     "$NODE_FILE" \
-    "$RUN_FILE"
+    "$RUN_FILE" \
+    "$CAP_FILE"
 
 cleanup_extra()
 {
@@ -115,7 +117,8 @@ cleanup_extra()
         "$HW_FILE" \
         "$IF_FILE" \
         "$NODE_FILE" \
-        "$RUN_FILE"
+        "$RUN_FILE" \
+        "$CAP_FILE"
 }
 
 trap 'cleanup; cleanup_extra' EXIT INT TERM
@@ -212,11 +215,16 @@ cat >> "$TMP_FILE" <<'EOF'
 # TYPE vpp_cgnat_mapping_port_utilization_estimate gauge
 EOF
 
-awk -v session_cap="$DET44_SESSION_CAPACITY_PER_USER" -v usable_ports="$DET44_USABLE_PORT_SLOTS" '
+awk -v usable_ports="$DET44_USABLE_PORT_SLOTS" -v cap_file="$CAP_FILE" '
 function esc(s) {
     gsub(/\\/,"\\\\",s)
     gsub(/"/,"\\\"",s)
     return s
+}
+
+function ip2int(ip, a) {
+    split(ip, a, ".")
+    return (a[1]*16777216) + (a[2]*65536) + (a[3]*256) + a[4]
 }
 
 BEGIN {
@@ -273,8 +281,21 @@ $1=="sessions" && $2=="number:" {
     if (ports <= 0 && ratio > 0)
         ports = int((usable_ports / ratio) + 0.5)
 
-    session_capacity = in_hosts * session_cap
+    # Confirmed DET44 behavior: session capacity per inside host equals
+    # the dynamically allocated ports_per_host.
+    session_capacity_per_user = ports
+    session_capacity = in_hosts * session_capacity_per_user
     port_capacity = in_hosts * ports
+
+    # Save normalized mapping data for the per-user session parser.
+    # Format: CIDR prefix network-address ports_per_host
+    split(inside, cap_cidr, "/")
+    cap_prefix = cap_cidr[2] + 0
+    cap_network = ip2int(cap_cidr[1])
+    cap_size = 2 ^ (32 - cap_prefix)
+    if (cap_size > 1)
+        cap_network = cap_network - (cap_network % cap_size)
+    printf "%s %d %.0f %d\n", inside, cap_prefix, cap_network, ports > cap_file
 
     if (session_capacity > 0)
         session_util = sessions / session_capacity
@@ -333,11 +354,12 @@ END {
     printf "# TYPE vpp_cgnat_total_port_capacity gauge\n"
     printf "vpp_cgnat_total_port_capacity %d\n", total_port_capacity
 
+    printf "# HELP vpp_cgnat_total_session_utilization Total DET44 session utilization\n"
+    printf "# TYPE vpp_cgnat_total_session_utilization gauge\n"
     if (total_session_capacity > 0)
-        printf "# HELP vpp_cgnat_total_session_utilization Total DET44 session utilization\n"
-        printf "# TYPE vpp_cgnat_total_session_utilization gauge\n"
-        printf "vpp_cgnat_total_session_utilization %.8f\n", \
-            total_sessions / total_session_capacity
+        printf "vpp_cgnat_total_session_utilization %.8f\n", total_sessions / total_session_capacity
+    else
+        printf "vpp_cgnat_total_session_utilization 0\n"
 }
 ' "$MAP_FILE" >> "$TMP_FILE"
 
@@ -375,11 +397,26 @@ cat >> "$TMP_FILE" <<'EOF'
 # TYPE vpp_cgnat_real_ip_sessions gauge
 EOF
 
-awk -v session_cap="$DET44_SESSION_CAPACITY_PER_USER" '
+awk -v cap_file="$CAP_FILE" '
 function esc(s) {
     gsub(/\\/,"\\\\",s)
     gsub(/"/,"\\\"",s)
     return s
+}
+
+function ip2int(ip, a) {
+    split(ip, a, ".")
+    return (a[1]*16777216) + (a[2]*65536) + (a[3]*256) + a[4]
+}
+
+function find_ports(ip, n, size, v) {
+    v=ip2int(ip)
+    for (n=1; n<=map_count; n++) {
+        size=2 ^ (32 - map_prefix[n])
+        if (v >= map_network[n] && v < (map_network[n] + size))
+            return map_ports[n]
+    }
+    return 0
 }
 
 function state_proto(s) {
@@ -387,6 +424,20 @@ function state_proto(s) {
     if (s ~ /^udp-/) return "udp"
     if (s ~ /^icmp-/) return "icmp"
     return "unknown"
+}
+
+BEGIN {
+    map_count=0
+    while ((getline line < cap_file) > 0) {
+        n=split(line, m, /[[:space:]]+/)
+        if (n >= 4) {
+            map_count++
+            map_prefix[map_count]=m[2] + 0
+            map_network[map_count]=m[3] + 0
+            map_ports[map_count]=m[4] + 0
+        }
+    }
+    close(cap_file)
 }
 
 {
@@ -443,11 +494,18 @@ END {
         printf "vpp_cgnat_user_sessions{inside=\"%s\"} %d\n", \
             esc(u), user_sessions[u]
 
-        printf "vpp_cgnat_user_session_capacity{inside=\"%s\"} 1000\n", \
-            esc(u)
+        user_capacity=find_ports(u)
+
+        printf "vpp_cgnat_user_session_capacity{inside=\"%s\"} %d\n", \
+            esc(u), user_capacity
+
+        if (user_capacity > 0)
+            user_util=user_sessions[u] / user_capacity
+        else
+            user_util=0
 
         printf "vpp_cgnat_user_session_utilization{inside=\"%s\"} %.8f\n", \
-            esc(u), user_sessions[u] / session_cap
+            esc(u), user_util
 
         ext_count=0
 
@@ -514,7 +572,7 @@ cat >> "$TMP_FILE" <<'EOF'
 # TYPE vpp_cgnat_real_ip_session_capacity gauge
 EOF
 
-awk -v session_cap="$DET44_SESSION_CAPACITY_PER_USER" '
+awk -v usable_ports="$DET44_USABLE_PORT_SLOTS" '
 {
     sub(/\r$/, "", $0)
 }
@@ -523,11 +581,17 @@ $1=="in" && $3=="out" {
     inside=$2
     outside=$4
     ratio=0
+    ports=0
     next
 }
 
 $1=="outside" && $2=="address" && $3=="sharing" && $4=="ratio:" {
     ratio=$5
+    next
+}
+
+$1=="number" && $2=="of" && $3=="ports" && $4=="per" && $5=="inside" && $6=="host:" {
+    ports=$7
     next
 }
 
@@ -550,7 +614,11 @@ $1=="sessions" && $2=="number:" {
 
     users_per_ip=ratio
 
-    session_capacity=users_per_ip * session_cap
+    if (ports <= 0 && ratio > 0)
+        ports = int((usable_ports / ratio) + 0.5)
+
+    # Confirmed DET44 behavior: session capacity per user equals ports_per_host.
+    session_capacity=users_per_ip * ports
 
     # Expand outside CIDR.
     split(p[1], oct, ".")
@@ -765,106 +833,33 @@ function esc(s) {
     return s
 }
 
-function valid_counter(s) {
-    gsub(/,/, "", s)
-    return s ~ /^[0-9]+([.][0-9]+)?$/
-}
-
 {
     sub(/\r$/, "", $0)
 }
 
-###############################################################################
-# Interface header + RX packets
-#
-# Example:
-#
-# BondEthernet0  5  up  12000/0/0/0  rx packets  97776971583
-#
-###############################################################################
-
-$0 ~ /^[^ \t][^ \t]*[ \t]+[0-9]+[ \t]+(up|down)([ \t]|$)/ {
-
+$0 !~ /^[ \t]/ && NF >= 2 && $1 != "Name" {
     iface=$1
-
-    # RX packets находится НА ЭТОЙ ЖЕ строке
-    for (i=1; i<=NF-2; i++) {
-        if ($i == "rx" && $(i+1) == "packets") {
-
-            value=$(i+2)
-
-            if (valid_counter(value)) {
-                printf "vpp_if_rx_packets{interface=\"%s\"} %s\n", \
-                    esc(iface), value
-            }
-
-            break
-        }
-    }
-
-    next
 }
 
-###############################################################################
-# RX bytes
-###############################################################################
-
-$1=="rx" && $2=="bytes" {
-    value=$NF
-
-    if (iface != "" && valid_counter(value)) {
-        printf "vpp_if_rx_bytes{interface=\"%s\"} %s\n", \
-            esc(iface), value
-    }
-
-    next
+$1=="rx" && $2=="packets" && iface!="" {
+    printf "vpp_if_rx_packets{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 
-###############################################################################
-# TX packets
-###############################################################################
-
-$1=="tx" && $2=="packets" {
-    value=$NF
-
-    if (iface != "" && valid_counter(value)) {
-        printf "vpp_if_tx_packets{interface=\"%s\"} %s\n", \
-            esc(iface), value
-    }
-
-    next
+$1=="rx" && $2=="bytes" && iface!="" {
+    printf "vpp_if_rx_bytes{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 
-###############################################################################
-# TX bytes
-###############################################################################
-
-$1=="tx" && $2=="bytes" {
-    value=$NF
-
-    if (iface != "" && valid_counter(value)) {
-        printf "vpp_if_tx_bytes{interface=\"%s\"} %s\n", \
-            esc(iface), value
-    }
-
-    next
+$1=="tx" && $2=="packets" && iface!="" {
+    printf "vpp_if_tx_packets{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 
-###############################################################################
-# Drops
-###############################################################################
-
-$1=="drops" {
-    value=$NF
-
-    if (iface != "" && valid_counter(value)) {
-        printf "vpp_if_drops{interface=\"%s\"} %s\n", \
-            esc(iface), value
-    }
-
-    next
+$1=="tx" && $2=="bytes" && iface!="" {
+    printf "vpp_if_tx_bytes{interface=\"%s\"} %s\n", esc(iface), $NF
 }
 
+$1=="drops" && iface!="" {
+    printf "vpp_if_drops{interface=\"%s\"} %s\n", esc(iface), $NF
+}
 ' "$IF_FILE" >> "$TMP_FILE"
 
 fi
