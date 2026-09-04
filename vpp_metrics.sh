@@ -3,7 +3,7 @@
 ###############################################################################
 # VPP / VyOS CGNAT Prometheus exporter
 #
-# Version: 5.5-production
+# Version: 5.6-production
 #
 # Tested against:
 #   VyOS 2026.07.x
@@ -35,11 +35,11 @@ set -o pipefail
 # Configuration
 ###############################################################################
 
-TEXTFILE_DIR="/run/node_exporter/collector"
-PROM_FILE="${TEXTFILE_DIR}/vpp_metrics2.prom"
+TEXTFILE_DIR="${TEXTFILE_DIR:-/run/node_exporter/collector}"
+PROM_FILE="${PROM_FILE:-${TEXTFILE_DIR}/vpp_metrics2.prom}"
 TMP_FILE="${PROM_FILE}.tmp.$$"
 
-VPPCTL="/usr/bin/vppctl"
+VPPCTL="${VPPCTL:-/usr/bin/vppctl}"
 
 # DET44 session capacity per inside host.
 # This is a VPP DET44 session-slot limit, NOT the number of ports.
@@ -97,6 +97,7 @@ IF_FILE="/tmp/vpp_metrics_v5_if.$$"
 NODE_FILE="/tmp/vpp_metrics_v5_node.$$"
 RUN_FILE="/tmp/vpp_metrics_v5_run.$$"
 CAP_FILE="/tmp/vpp_metrics_v5_cap.$$"
+RXP_FILE="/tmp/vpp_metrics_v5_rxp.$$"
 
 rm -f \
     "$MAP_FILE" \
@@ -106,7 +107,8 @@ rm -f \
     "$IF_FILE" \
     "$NODE_FILE" \
     "$RUN_FILE" \
-    "$CAP_FILE"
+    "$CAP_FILE" \
+    "$RXP_FILE"
 
 cleanup_extra()
 {
@@ -118,7 +120,8 @@ cleanup_extra()
         "$IF_FILE" \
         "$NODE_FILE" \
         "$RUN_FILE" \
-        "$CAP_FILE"
+        "$CAP_FILE" \
+        "$RXP_FILE"
 }
 
 trap 'cleanup; cleanup_extra' EXIT INT TERM
@@ -148,6 +151,9 @@ NODE_RC=$?
 "$VPPCTL" show runtime > "$RUN_FILE" 2>/dev/null
 RUN_RC=$?
 
+"$VPPCTL" show interface rx-placement > "$RXP_FILE" 2>/dev/null
+RXP_RC=$?
+
 ###############################################################################
 # Exporter health
 ###############################################################################
@@ -176,6 +182,7 @@ echo "vpp_metrics_command_success{command=\"interfaces\"} $([ "$IF_RC" -eq 0 ] &
 echo "vpp_metrics_command_success{command=\"node_errors\"} $([ "$NODE_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
 echo "vpp_metrics_command_success{command=\"node_counters\"} $([ "$NODE_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
 echo "vpp_metrics_command_success{command=\"runtime\"} $([ "$RUN_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
+echo "vpp_metrics_command_success{command=\"rx_placement\"} $([ "$RXP_RC" -eq 0 ] && echo 1 || echo 0)" >> "$TMP_FILE"
 
 ###############################################################################
 # 1. DET44 MAPPINGS
@@ -875,6 +882,63 @@ $1=="drops" && iface!="" {
 fi
 
 ###############################################################################
+# 7A. RX QUEUE PLACEMENT
+#
+# Read-only topology exported from:
+#   vppctl show interface rx-placement
+#
+# This is intentionally separate from interface counters.  It lets Grafana
+# correlate a physical RX queue with the VPP worker polling that queue.
+###############################################################################
+
+if [ "$RXP_RC" -eq 0 ] && [ -s "$RXP_FILE" ]; then
+
+cat >> "$TMP_FILE" <<'EOF'
+# HELP vpp_rx_queue_placement_info VPP RX queue to worker placement information
+# TYPE vpp_rx_queue_placement_info gauge
+EOF
+
+awk '
+function esc(s) {
+    gsub(/\\/,"\\\\",s)
+    gsub(/"/,"\\\"",s)
+    return s
+}
+
+{
+    gsub(/\r/, "", $0)
+}
+
+$1=="Thread" && NF >= 3 {
+    thread=$3
+    sub(/^\(/, "", thread)
+    sub(/\):$/, "", thread)
+    node=""
+    next
+}
+
+$1=="node" && NF >= 2 {
+    node=$2
+    sub(/:$/, "", node)
+    next
+}
+
+$2=="queue" && $3 ~ /^[0-9]+$/ {
+    iface=$1
+    queue=$3
+    mode=$4
+    gsub(/[()]/, "", mode)
+
+    if (thread != "" && node != "" && iface != "" && mode != "") {
+        printf "vpp_rx_queue_placement_info{interface=\"%s\",queue=\"%s\",thread=\"%s\",node=\"%s\",mode=\"%s\"} 1\n", \
+            esc(iface), esc(queue), esc(thread), esc(node), esc(mode)
+    }
+}
+' "$RXP_FILE" >> "$TMP_FILE"
+
+fi
+
+###############################################################################
 # 8. BUFFERS
 ###############################################################################
 
@@ -943,6 +1007,21 @@ cat >> "$TMP_FILE" <<'EOF'
 
 # HELP vpp_runtime_average_vectors Average vectors per node per thread
 # TYPE vpp_runtime_average_vectors gauge
+
+# HELP vpp_runtime_node_calls_total VPP runtime node calls since last runtime clear
+# TYPE vpp_runtime_node_calls_total counter
+
+# HELP vpp_runtime_node_vectors_total VPP runtime node vectors since last runtime clear
+# TYPE vpp_runtime_node_vectors_total counter
+
+# HELP vpp_runtime_node_suspends_total VPP runtime node suspends since last runtime clear
+# TYPE vpp_runtime_node_suspends_total counter
+
+# HELP vpp_runtime_node_clocks VPP show runtime Clocks value; for packet nodes this is clocks per packet
+# TYPE vpp_runtime_node_clocks gauge
+
+# HELP vpp_runtime_node_vectors_per_call VPP runtime node vectors per call
+# TYPE vpp_runtime_node_vectors_per_call gauge
 EOF
 
 awk '
@@ -964,6 +1043,10 @@ function valid_number(s) {
     if (s ~ /^[+-]?[0-9]+([.][0-9]*)?([eE][+-]?[0-9]+)?$/) return 1
     if (s ~ /^[+-]?[.][0-9]+([eE][+-]?[0-9]+)?$/) return 1
     return 0
+}
+
+function monitored_node(n) {
+    return (n ~ /^(det44-in2out|det44-out2in|dpdk-input|bond-input|ethernet-input|ip4-input|ip4-lookup|ip4-rewrite|ip4-sv-reassembly-feature|drop|error-drop)$/)
 }
 
 $1=="Thread" {
@@ -1030,6 +1113,38 @@ thread != "" {
             if (valid_number(loops))
                 printf "vpp_runtime_loops_sec{thread=\"%s\"} %s\n", esc(thread), clean(loops)
             break
+        }
+    }
+
+    # Runtime node table.  Parse columns from the RIGHT because node State may
+    # contain spaces (for example "any wait").  Only a small diagnostic
+    # allow-list is exported to keep Prometheus cardinality bounded.
+    node_name=$1
+    if (monitored_node(node_name) && NF >= 7) {
+        calls=$(NF-4)
+        vectors=$(NF-3)
+        suspends=$(NF-2)
+        clocks=$(NF-1)
+        vectors_per_call=$NF
+
+        if (valid_number(calls) && valid_number(vectors) &&
+            valid_number(suspends) && valid_number(clocks) &&
+            valid_number(vectors_per_call)) {
+
+            printf "vpp_runtime_node_calls_total{thread=\"%s\",node=\"%s\"} %s\n", \
+                esc(thread), esc(node_name), clean(calls)
+
+            printf "vpp_runtime_node_vectors_total{thread=\"%s\",node=\"%s\"} %s\n", \
+                esc(thread), esc(node_name), clean(vectors)
+
+            printf "vpp_runtime_node_suspends_total{thread=\"%s\",node=\"%s\"} %s\n", \
+                esc(thread), esc(node_name), clean(suspends)
+
+            printf "vpp_runtime_node_clocks{thread=\"%s\",node=\"%s\"} %s\n", \
+                esc(thread), esc(node_name), clean(clocks)
+
+            printf "vpp_runtime_node_vectors_per_call{thread=\"%s\",node=\"%s\"} %s\n", \
+                esc(thread), esc(node_name), clean(vectors_per_call)
         }
     }
 }
