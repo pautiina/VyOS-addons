@@ -841,8 +841,18 @@ $0 !~ /^[ \t]/ && NF >= 2 && $1 != "Name" {
     iface=$1
 }
 
-$1=="rx" && $2=="packets" && iface!="" {
-    printf "vpp_if_rx_packets{interface=\"%s\"} %s\n", esc(iface), $NF
+# RX packets is printed on the SAME line as the interface name by VPP.
+# Therefore it cannot be parsed with $1=="rx".
+# Scan field pairs so both formats are supported:
+#   BondEthernet0 ... rx packets 123
+#   <indent> rx packets 123
+{
+    for (i=1; i<NF; i++) {
+        if ($i=="rx" && $(i+1)=="packets" && $(i+2) ~ /^[0-9]+$/ && iface!="") {
+            printf "vpp_if_rx_packets{interface=\"%s\"} %s\n", esc(iface), $(i+2)
+            break
+        }
+    }
 }
 
 $1=="rx" && $2=="bytes" && iface!="" {
